@@ -1748,3 +1748,206 @@ def test_load_json_format_cannot_execute_code(tmp_path: Path, loop) -> None:
     jar = CookieJar(loop=loop)
     jar.load(file_path)  # must not raise and must not execute anything
     assert "x" in jar.filter_cookies(URL("https://example.com/"))
+
+
+# === Scope/expiry persistence for the pickle format (CVE-2026-54279) ===
+#
+# The plain pickle format persisted only ``self._cookies``, so host-only scope
+# and absolute expirations were lost on reload — a host-only cookie came back
+# as a domain cookie and leaked to subdomains. save() now appends a second
+# pickle object carrying that state; load() restores it. The on-disk format
+# stays pickle, so files remain interchangeable with unpatched aiohttp.
+
+
+def test_save_load_pickle_preserves_host_only_scope(tmp_path: Path, loop) -> None:
+    """A host-only cookie must not reload as a domain cookie (the CVE)."""
+    file_path = tmp_path / "host_only.pkl"
+    issuer = URL("https://auth.example.com/login")
+    subdomain = URL("https://sub.auth.example.com/")
+
+    jar_save = CookieJar(loop=loop)
+    jar_save.update_cookies({"sid": "hostonly"}, response_url=issuer)
+    assert "sid" not in jar_save.filter_cookies(subdomain)
+    jar_save.save(file_path=file_path)
+
+    jar_load = CookieJar(loop=loop)
+    jar_load.load(file_path=file_path)
+
+    assert jar_load._host_only_cookies == {("auth.example.com", "sid")}
+    assert "sid" not in jar_load.filter_cookies(subdomain)
+    assert "sid" in jar_load.filter_cookies(issuer)
+
+
+def test_save_load_pickle_domain_cookie_still_matches_subdomain(
+    tmp_path: Path,
+    loop,
+) -> None:
+    """An explicit Domain cookie must stay valid for subdomains (no regression)."""
+    file_path = tmp_path / "domain.pkl"
+    subdomain = URL("https://sub.example.com/")
+
+    jar_save = CookieJar(loop=loop)
+    jar_save.update_cookies_from_headers(
+        ["sid=domaincookie; Domain=example.com"], URL("https://example.com/")
+    )
+    jar_save.save(file_path=file_path)
+
+    jar_load = CookieJar(loop=loop)
+    jar_load.load(file_path=file_path)
+
+    assert jar_load._host_only_cookies == set()
+    assert "sid" in jar_load.filter_cookies(subdomain)
+
+
+def test_save_load_pickle_preserves_expiration_deadline(tmp_path: Path, loop) -> None:
+    """The absolute deadline survives the round-trip and is not reset."""
+    file_path = tmp_path / "max_age.pkl"
+    url = URL("https://example.com/")
+
+    jar_save = CookieJar(loop=loop)
+    jar_save.update_cookies_from_headers(
+        ["sid=x; Max-Age=3600; Domain=example.com"], url
+    )
+    expirations = dict(jar_save._expirations)
+    assert expirations  # a deadline was scheduled
+    jar_save.save(file_path=file_path)
+
+    jar_load = CookieJar(loop=loop)
+    jar_load.load(file_path=file_path)
+
+    assert dict(jar_load._expirations) == expirations
+    assert "sid" in jar_load.filter_cookies(url)
+
+
+def test_save_load_pickle_drops_expired_cookie_on_load(tmp_path: Path, loop) -> None:
+    """A cookie whose persisted deadline is in the past is dropped on load."""
+    file_path = tmp_path / "expired.pkl"
+    url = URL("https://example.com/")
+
+    jar_save = CookieJar(loop=loop)
+    jar_save.update_cookies_from_headers(
+        ["sid=x; Expires=Tue, 1 Jan 2999 12:00:00 GMT; Domain=example.com"], url
+    )
+    # Force the persisted deadline into the past; the cookie still survives save().
+    key = next(iter(jar_save._expirations))
+    jar_save._expirations[key] = 0.0
+    jar_save.save(file_path=file_path)
+
+    jar_load = CookieJar(loop=loop)
+    jar_load.load(file_path=file_path)
+
+    assert len(jar_load) == 0
+    assert "sid" not in jar_load.filter_cookies(url)
+
+
+def test_load_legacy_single_pickle_file(tmp_path: Path, loop) -> None:
+    """A file written by unpatched aiohttp (one pickle object) still loads.
+
+    The second load raises EOFError, which load() catches and treats as
+    "no metadata", so scope/expiry stay as the pre-patch behavior.
+    """
+    file_path = tmp_path / "legacy.pkl"
+    jar_save = CookieJar(loop=loop)
+    jar_save.update_cookies_from_headers(
+        ["sid=x; Domain=example.com"], URL("https://example.com/")
+    )
+    # Emulate the unpatched writer: a single pickle object, no metadata.
+    with open(file_path, "wb") as f:
+        pickle.dump(jar_save._cookies, f, pickle.HIGHEST_PROTOCOL)
+
+    jar_load = CookieJar(loop=loop)
+    jar_load.load(file_path=file_path)  # must not raise
+    assert "sid" in jar_load.filter_cookies(URL("https://sub.example.com/"))
+
+
+def test_saved_file_readable_by_single_pickle_load(tmp_path: Path, loop) -> None:
+    """An unpatched reader (one bare pickle.load) can still read a saved file."""
+    file_path = tmp_path / "seal.pkl"
+    jar_save = CookieJar(loop=loop)
+    jar_save.update_cookies({"sid": "x"}, response_url=URL("https://example.com/"))
+    jar_save.save(file_path=file_path)
+
+    # A single bare pickle.load — what unpatched aiohttp does — returns the
+    # cookie mapping (first object) and ignores the trailing metadata object.
+    with open(file_path, "rb") as f:
+        loaded = pickle.load(f)
+    morsels = [m for cookie in loaded.values() for m in cookie.values()]
+    assert any(m.key == "sid" for m in morsels)
+
+
+def test_load_rejects_malicious_second_object(tmp_path: Path, loop) -> None:
+    """The restricted unpickler must guard the metadata object too."""
+    import os
+
+    file_path = tmp_path / "evil_meta.pkl"
+
+    class RCEPayload:
+        def __reduce__(self) -> "tuple[object, ...]":
+            return (os.system, ("echo PWNED",))
+
+    with open(file_path, "wb") as f:
+        pickle.dump({}, f, pickle.HIGHEST_PROTOCOL)  # benign first object
+        pickle.dump(RCEPayload(), f, pickle.HIGHEST_PROTOCOL)  # malicious metadata
+
+    jar = CookieJar(loop=loop)
+    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
+        jar.load(file_path)
+
+
+def test_load_json_preserves_host_only_scope_from_patched_peer(
+    tmp_path: Path,
+    loop,
+) -> None:
+    """A host_only field in an upstream >= 3.14.1 JSON file keeps host-only scope."""
+    file_path = tmp_path / "peer.json"
+    file_path.write_text(
+        json.dumps(
+            {
+                "auth.example.com|/": {
+                    "sid": {
+                        "key": "sid",
+                        "value": "hostonly",
+                        "coded_value": "hostonly",
+                        "host_only": True,
+                    }
+                }
+            }
+        )
+    )
+
+    jar = CookieJar(loop=loop)
+    jar.load(file_path)
+
+    assert jar._host_only_cookies == {("auth.example.com", "sid")}
+    assert "sid" not in jar.filter_cookies(URL("https://sub.auth.example.com/"))
+    assert "sid" in jar.filter_cookies(URL("https://auth.example.com/"))
+
+
+def test_load_json_restores_expires_timestamp_from_patched_peer(
+    tmp_path: Path,
+    loop,
+) -> None:
+    """An expires_timestamp in a patched-peer JSON file restores the deadline."""
+    file_path = tmp_path / "peer_exp.json"
+    future = 4102444800.0  # 2100-01-01
+    file_path.write_text(
+        json.dumps(
+            {
+                "example.com|/": {
+                    "sid": {
+                        "key": "sid",
+                        "value": "x",
+                        "coded_value": "x",
+                        "domain": "example.com",
+                        "expires_timestamp": future,
+                    }
+                }
+            }
+        )
+    )
+
+    jar = CookieJar(loop=loop)
+    jar.load(file_path)
+
+    assert jar._expirations[("example.com", "/", "sid")] == future
+    assert "sid" in jar.filter_cookies(URL("https://example.com/"))

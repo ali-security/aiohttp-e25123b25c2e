@@ -165,9 +165,30 @@ class CookieJar(AbstractCookieJar):
         return self._quote_cookie
 
     def save(self, file_path: PathLike) -> None:
+        """Save cookies to a file in pickle format.
+
+        The cookie mapping is written as the first pickle object, exactly
+        as unpatched aiohttp does, so an old ``load()`` that issues a single
+        ``pickle.load`` still reads it and any trailing bytes are ignored.
+
+        The plain pickle format persisted only ``self._cookies``, dropping
+        the host-only scope and the absolute expiration deadlines on reload
+        (CVE-2026-54279): a host-only cookie came back as a domain cookie
+        and leaked to subdomains. A second pickle object records that state
+        so ``load()`` can restore it; the on-disk format stays pickle, so
+        files remain interchangeable with unpatched aiohttp.
+        """
         file_path = pathlib.Path(file_path)
         with file_path.open(mode="wb") as f:
             pickle.dump(self._cookies, f, pickle.HIGHEST_PROTOCOL)
+            pickle.dump(
+                {
+                    "host_only": self._host_only_cookies,
+                    "expirations": self._expirations,
+                },
+                f,
+                pickle.HIGHEST_PROTOCOL,
+            )
 
     def load(self, file_path: PathLike) -> None:
         """Load cookies from a file.
@@ -192,19 +213,53 @@ class CookieJar(AbstractCookieJar):
                 data = json.load(f)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             # Not JSON -> pickle format (this version or unpatched aiohttp).
-            with file_path.open(mode="rb") as f:
-                self._cookies = _RestrictedCookieUnpickler(f).load()
+            self._load_pickle_data(file_path)
         else:
-            self._cookies = self._load_json_data(data)
+            self._load_json_data(data)
+
+    def _load_pickle_data(self, file_path: pathlib.Path) -> None:
+        """Load cookies from the pickle format written by ``save()``.
+
+        The cookie mapping is read through the restricted unpickler. A file
+        written by this version carries a second pickle object with the
+        host-only scope and the absolute expirations (CVE-2026-54279); both
+        are restored so host-only cookies do not reload as domain cookies
+        and leak to subdomains, and expired cookies are dropped. Files
+        written by older versions have no second object, so their scope and
+        expiry behave exactly as before.
+        """
+        with file_path.open(mode="rb") as f:
+            self._cookies = _RestrictedCookieUnpickler(f).load()
+            try:
+                # A fresh unpickler per object: reusing one instance would let
+                # the first object's pickle memo bleed into the second read.
+                metadata = _RestrictedCookieUnpickler(f).load()
+            except EOFError:
+                # Legacy single-object file; nothing more to restore.
+                return
+        self._host_only_cookies = metadata["host_only"]
+        self._expirations = metadata["expirations"]
+        # _expire_heap is a derived index; rebuild it from _expirations.
+        self._expire_heap = [(when, key) for key, when in self._expirations.items()]
+        heapq.heapify(self._expire_heap)
+        # Drop cookies whose restored deadline is already in the past.
+        self._do_expiration()
 
     def _load_json_data(
-        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]]
-    ) -> DefaultDict[Tuple[str, str], SimpleCookie]:
-        """Rebuild the cookie mapping from parsed JSON data."""
-        cookies: DefaultDict[Tuple[str, str], SimpleCookie] = defaultdict(SimpleCookie)
+        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool, float]]]]
+    ) -> None:
+        """Replace contents from parsed JSON, routing cookies through update_cookies().
+
+        Honors the ``host_only`` and ``expires_timestamp`` fields that
+        upstream aiohttp >= 3.14.1 records (CVE-2026-54279), so a host-only
+        cookie read from a patched peer keeps its host-only scope instead of
+        loading as a domain cookie and leaking to subdomains, and absolute
+        expirations are restored rather than reset. Loaded cookies pass
+        through the same acceptance rules as :meth:`update_cookies`.
+        """
+        self.clear()
         for compound_key, cookie_data in data.items():
             domain, path = compound_key.split("|", 1)
-            key = (domain, path)
             for name, morsel_data in cookie_data.items():
                 morsel: Morsel[str] = Morsel()
                 # __setstate__ bypasses validation and sets already-validated
@@ -217,10 +272,26 @@ class CookieJar(AbstractCookieJar):
                     }
                 )
                 for attr, attr_val in morsel_data.items():
-                    if attr not in ("key", "value", "coded_value"):
+                    if attr not in (
+                        "key",
+                        "value",
+                        "coded_value",
+                        "host_only",
+                        "expires_timestamp",
+                    ):
                         morsel[attr] = attr_val  # type: ignore[assignment]
-                cookies[key][name] = morsel
-        return cookies
+                # Drop the domain so update_cookies() re-marks it host-only.
+                if morsel_data.get("host_only"):
+                    morsel["domain"] = ""
+                response_url = (
+                    URL.build(scheme="https", host=domain) if domain else URL()
+                )
+                self.update_cookies({name: morsel}, response_url)
+                # Restore the absolute deadline; update_cookies() schedules none.
+                exp = morsel_data.get("expires_timestamp")
+                if exp is not None:
+                    self._expire_cookie(float(exp), domain, path, name)
+        self._do_expiration()
 
     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
         if predicate is None:
