@@ -142,6 +142,9 @@ class RequestHandler(BaseProtocol):
     """
 
     __slots__ = (
+        "max_field_size",
+        "max_headers",
+        "max_line_size",
         "_request_count",
         "_keepalive",
         "_manager",
@@ -204,6 +207,12 @@ class RequestHandler(BaseProtocol):
         self._manager: Optional[Server] = manager
         self._request_handler: Optional[_RequestHandler] = manager.request_handler
         self._request_factory: Optional[_RequestFactory] = manager.request_factory
+
+        # Explicitly annotated: ``web_request`` reads these back off the
+        # protocol and mypy cannot infer them across the import cycle.
+        self.max_line_size: int = max_line_size
+        self.max_headers: int = max_headers
+        self.max_field_size: int = max_field_size
 
         self._tcp_keepalive = tcp_keepalive
         # placeholder to be replaced on keepalive timeout setup
