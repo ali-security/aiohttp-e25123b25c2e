@@ -35,6 +35,7 @@ from .helpers import (
     parse_mimetype,
     sentinel,
 )
+from .http_writer import _safe_header
 from .streams import StreamReader
 from .typedefs import JSONEncoder, _CIMultiDict
 
@@ -209,9 +210,10 @@ class Payload(ABC):
     @property
     def _binary_headers(self) -> bytes:
         return (
-            "".join([k + ": " + v + "\r\n" for k, v in self.headers.items()]).encode(
-                "utf-8"
-            )
+            "".join(
+                _safe_header(k) + ": " + _safe_header(v) + "\r\n"
+                for k, v in self.headers.items()
+            ).encode("utf-8")
             + b"\r\n"
         )
 
