@@ -213,10 +213,20 @@ def test_bad_header_name(parser: Any, rfc9110_5_6_2_token_delim: str) -> None:
         "Foo : bar",  # https://www.rfc-editor.org/rfc/rfc9112.html#section-5.1-2
         "Foo\t: bar",
         "\xffoo: bar",
+        "Foo: abc\x01def",  # CTL bytes forbidden per RFC 9110 §5.5
+        "Foo: abc\x7fdef",  # DEL is also a CTL byte
+        "Foo: abc\x1fdef",
     ),
 )
 def test_bad_headers(parser: Any, hdr: str) -> None:
     text = f"POST / HTTP/1.1\r\n{hdr}\r\n\r\n".encode()
+    with pytest.raises(http_exceptions.BadHttpMessage):
+        parser.feed_data(text)
+
+
+def test_ctl_host_header_bad_characters(parser: HttpRequestParser) -> None:
+    """CTL byte in Host header must be rejected."""
+    text = b"GET /test HTTP/1.1\r\nHost: trusted.example\x01@bad.test\r\n\r\n"
     with pytest.raises(http_exceptions.BadHttpMessage):
         parser.feed_data(text)
 
@@ -1195,7 +1205,14 @@ def test_http_response_parser_strict_headers(response) -> None:
         response.feed_data(b"HTTP/1.1 200 test\r\nFoo: abc\x01def\r\n\r\n")
 
 
-def test_http_response_parser_bad_crlf(response) -> None:
+def test_http_response_parser_null_byte_in_header_value(
+    response: HttpResponseParser,
+) -> None:
+    with pytest.raises(http_exceptions.InvalidHeader):
+        response.feed_data(b"HTTP/1.1 200 OK\r\nFoo: abc\x00def\r\n\r\n")
+
+
+def test_http_response_parser_bad_crlf(response: HttpResponseParser) -> None:
     """Still a lot of dodgy servers sending bad requests like this."""
     messages, upgrade, tail = response.feed_data(
         b"HTTP/1.0 200 OK\nFoo: abc\nBar: def\n\nBODY\n"
