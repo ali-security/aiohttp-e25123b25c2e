@@ -1016,6 +1016,48 @@ def test_serialize_headers_raises_on_null_byte() -> None:
         _serialize_headers(status_line, headers)
 
 
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\n",
+        "\r",
+        "\x00",
+    ],
+)
+def test_serialize_headers_raises_on_status_line_injection(char: str) -> None:
+    """Verify serialize_headers validates the status line, not only the headers."""
+    status_line = f"HTTP/1.1 200 OK{char}Set-Cookie: evil=1"
+    headers: "CIMultiDict[str]" = CIMultiDict({hdrs.CONTENT_TYPE: "text/plain"})
+
+    with pytest.raises(
+        ValueError,
+        match="detected in headers",
+    ):
+        _serialize_headers(status_line, headers)
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\n",
+        "\r",
+        "\x00",
+    ],
+)
+async def test_write_headers_prevents_status_line_injection(
+    char: str,
+    protocol: BaseProtocol,
+    transport: mock.Mock,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """A tainted reason phrase must not be able to split the response."""
+    msg = http.StreamWriter(protocol, loop)
+    status_line = f"HTTP/1.1 200 OK{char}Set-Cookie: evil=1"
+
+    with pytest.raises(ValueError, match="detected in headers"):
+        await msg.write_headers(status_line, CIMultiDict())
+
+
 async def test_write_compressed_data_with_headers_coalescing(
     buf: bytearray,
     protocol: BaseProtocol,
