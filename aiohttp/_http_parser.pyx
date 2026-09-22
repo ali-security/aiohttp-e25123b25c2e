@@ -322,6 +322,9 @@ cdef class HttpParser:
         list    _raw_headers
         bint    _upgraded
         list    _messages
+        Py_ssize_t _msg_in_flight
+        Py_ssize_t _max_msg_queue_size
+        bytes   _queued_tail
         object  _payload
         bint    _payload_error
         object  _payload_exception
@@ -356,6 +359,7 @@ cdef class HttpParser:
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
         bint auto_decompress=True,
+        Py_ssize_t max_msg_queue_size=0,
     ):
         cparser.llhttp_settings_init(self._csettings)
         cparser.llhttp_init(self._cparser, mode, self._csettings)
@@ -371,6 +375,9 @@ cdef class HttpParser:
         self._payload_error = 0
         self._payload_exception = payload_exception
         self._messages = []
+        self._msg_in_flight = 0
+        self._max_msg_queue_size = max_msg_queue_size
+        self._queued_tail = EMPTY_BYTES
 
         self._raw_name = EMPTY_BYTES
         self._raw_value = EMPTY_BYTES
@@ -542,6 +549,11 @@ cdef class HttpParser:
 
     ### Public API ###
 
+    def message_consumed(self):
+        # Protocol drained a queued message; free a slot for parsing.
+        if self._msg_in_flight > 0:
+            self._msg_in_flight -= 1
+
     def feed_eof(self):
         cdef bytes desc
 
@@ -568,6 +580,11 @@ cdef class HttpParser:
             size_t nb
             cdef cparser.llhttp_errno_t errno
 
+        if self._queued_tail:
+            # Data left over from a message-queue pause; parse it first.
+            data = self._queued_tail + data
+            self._queued_tail = EMPTY_BYTES
+
         PyObject_GetBuffer(data, &self.py_buf, PyBUF_SIMPLE)
         data_len = <size_t>self.py_buf.len
 
@@ -580,10 +597,18 @@ cdef class HttpParser:
             cparser.llhttp_resume_after_upgrade(self._cparser)
 
             nb = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
+        elif errno is cparser.HPE_PAUSED:
+            # Queue full: cb_on_message_complete() paused llhttp between
+            # messages. Buffer the unparsed remainder and resume the parser so
+            # feed_data(b"") re-feeds it once the queue drains.
+            nb = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
+            self._queued_tail = bytes(data[nb:])
+            cparser.llhttp_resume(self._cparser)
 
         PyBuffer_Release(&self.py_buf)
 
-        if errno not in (cparser.HPE_OK, cparser.HPE_PAUSED_UPGRADE):
+        if errno not in (cparser.HPE_OK, cparser.HPE_PAUSED_UPGRADE,
+                         cparser.HPE_PAUSED):
             if self._payload_error == 0:
                 if self._last_error is not None:
                     ex = self._last_error
@@ -621,12 +646,12 @@ cdef class HttpRequestParser(HttpParser):
         size_t max_line_size=8190, size_t max_headers=128,
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
-        bint auto_decompress=True,
+        bint auto_decompress=True, Py_ssize_t max_msg_queue_size=0,
     ):
         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress)
+                   auto_decompress, max_msg_queue_size)
 
     cdef object _on_status_complete(self):
         cdef int idx1, idx2
@@ -827,6 +852,12 @@ cdef int cb_on_message_complete(cparser.llhttp_t* parser) except -1:
         pyparser._last_error = exc
         return -1
     else:
+        if pyparser._max_msg_queue_size and not pyparser._upgraded:
+            pyparser._msg_in_flight += 1
+            if pyparser._msg_in_flight >= pyparser._max_msg_queue_size:
+                # Queue full: pause llhttp between messages. feed_data() buffers
+                # the remainder as tail; resumes once the queue drains.
+                return cparser.HPE_PAUSED
         return 0
 
 

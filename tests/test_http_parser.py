@@ -4,7 +4,7 @@ import asyncio
 import re
 import zlib
 from contextlib import nullcontext
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Type
 from unittest import mock
 from urllib.parse import quote
 
@@ -110,6 +110,78 @@ def test_c_parser_loaded():
     assert "HttpResponseParserC" in dir(aiohttp.http_parser)
     assert "RawRequestMessageC" in dir(aiohttp.http_parser)
     assert "RawResponseMessageC" in dir(aiohttp.http_parser)
+
+
+_PIPELINED_GET = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+
+
+def _build_request_parser(
+    request_cls: Type[HttpRequestParser],
+    protocol: BaseProtocol,
+    loop: asyncio.AbstractEventLoop,
+    max_msg_queue_size: int,
+) -> HttpRequestParser:
+    return request_cls(
+        protocol,
+        loop,
+        2**16,
+        max_line_size=8190,
+        max_headers=128,
+        max_field_size=8190,
+        max_msg_queue_size=max_msg_queue_size,
+    )
+
+
+def test_max_msg_queue_size_caps_emitted_messages(
+    request_cls: Type[HttpRequestParser],
+    protocol: BaseProtocol,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    parser = _build_request_parser(request_cls, protocol, loop, 4)
+    messages, upgraded, _tail = parser.feed_data(_PIPELINED_GET * 10)
+    assert len(messages) == 4
+    assert not upgraded
+
+
+def test_max_msg_queue_size_resumes_after_consume(
+    request_cls: Type[HttpRequestParser],
+    protocol: BaseProtocol,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    limit = 4
+    total = 10
+    parser = _build_request_parser(request_cls, protocol, loop, limit)
+    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * total)
+    seen = 0
+    while messages:
+        assert len(messages) <= limit
+        seen += len(messages)
+        for _msg, _payload in messages:
+            parser.message_consumed()
+        messages, _upgraded, _tail = parser.feed_data(b"")
+    assert seen == total
+
+
+def test_max_msg_queue_size_zero_is_unbounded(
+    request_cls: Type[HttpRequestParser],
+    protocol: BaseProtocol,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    parser = _build_request_parser(request_cls, protocol, loop, 0)
+    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 50)
+    assert len(messages) == 50
+
+
+def test_message_consumed_underflow_is_ignored(
+    request_cls: Type[HttpRequestParser],
+    protocol: BaseProtocol,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    parser = _build_request_parser(request_cls, protocol, loop, 4)
+    # No message is in flight; consuming must not underflow the counter.
+    parser.message_consumed()
+    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 4)
+    assert len(messages) == 4
 
 
 def test_parse_headers(parser: Any) -> None:
