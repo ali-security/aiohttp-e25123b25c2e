@@ -1,5 +1,6 @@
 """Tests for internal cookie helper functions."""
 
+import logging
 from http.cookies import (
     CookieError,
     Morsel,
@@ -1402,14 +1403,35 @@ def test_parse_cookie_header_illegal_names(caplog: pytest.LogCaptureFixture) -> 
     """Test parse_cookie_header warns about illegal cookie names."""
     # Cookie name with comma (not allowed in _COOKIE_NAME_RE)
     header = "good=value; invalid,cookie=bad; another=test"
-    result = parse_cookie_header(header)
+    with caplog.at_level(logging.DEBUG):
+        result = parse_cookie_header(header)
     # Should skip the invalid cookie but continue parsing
     assert len(result) == 2
     assert result[0][0] == "good"
     assert result[0][1].value == "value"
     assert result[1][0] == "another"
     assert result[1][1].value == "test"
-    assert "Can not load cookie: Illegal cookie name 'invalid,cookie'" in caplog.text
+    assert "Cannot load cookie. Illegal cookie name" in caplog.text
+    assert "'invalid,cookie'" in caplog.text
+
+
+def test_parse_cookie_header_many_illegal_names_single_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test illegal cookie names are collected into a single log record."""
+    # Names with a comma pass the cookie pattern but fail _COOKIE_NAME_RE.
+    header = "; ".join(f"bad{chr(44)}name{i}=1" for i in range(3000))
+    with caplog.at_level(logging.DEBUG):
+        result = parse_cookie_header(header)
+
+    assert result == []
+    # A single record, no matter how many illegal names the header carried.
+    assert len(caplog.record_tuples) == 1
+    _, level, msg = caplog.record_tuples[0]
+    assert level is logging.DEBUG
+    assert "Cannot load cookie. Illegal cookie names" in msg
+    assert "'bad,name0'" in msg
+    assert "'bad,name2999'" in msg
 
 
 @pytest.mark.parametrize(

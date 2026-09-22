@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import socket
 from collections.abc import MutableMapping
 from typing import Any
@@ -378,6 +379,24 @@ def test_request_cookies_edge_cases() -> None:
     headers = CIMultiDict(COOKIE='test="quoted value"; normal=unquoted')
     req = make_mocked_request("GET", "/", headers=headers)
     assert req.cookies == {"test": "quoted value", "normal": "unquoted"}
+
+
+def test_request_cookies_many_invalid(caplog: pytest.LogCaptureFixture) -> None:
+    """Test many invalid cookies doesn't cause too many logs."""
+    # A comma is accepted by the cookie pattern's key group but rejected by
+    # _COOKIE_NAME_RE, so every pair below reaches the illegal-name path.
+    bad = "bad" + chr(44) + "name"
+    cookie = "; ".join(f"{bad}{i}=1" for i in range(3000))
+    req = make_mocked_request("GET", "/", headers=CIMultiDict(COOKIE=cookie))
+
+    with caplog.at_level(logging.DEBUG):
+        cookies = req.cookies
+
+    assert len(caplog.record_tuples) == 1
+    _, level, msg = caplog.record_tuples[0]
+    assert level is logging.DEBUG
+    assert "Cannot load cookie" in msg
+    assert cookies == {}
 
 
 def test_request_cookies_no_500_error() -> None:
