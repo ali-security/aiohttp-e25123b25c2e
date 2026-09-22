@@ -321,6 +321,7 @@ cdef class HttpParser:
         set     _seen_singletons
         list    _raw_headers
         bint    _upgraded
+        bint    _pending_upgrade
         list    _messages
         Py_ssize_t _msg_in_flight
         Py_ssize_t _max_msg_queue_size
@@ -390,6 +391,7 @@ cdef class HttpParser:
         self._response_with_body = response_with_body
         self._read_until_eof = read_until_eof
         self._upgraded = False
+        self._pending_upgrade = False
         self._auto_decompress = auto_decompress
         self._content_encoding = None
         self._lax = False
@@ -470,10 +472,15 @@ cdef class HttpParser:
             h_upg = headers.get("upgrade", "")
             allowed = upgrade and h_upg.isascii() and h_upg.lower() in ALLOWED_UPGRADES
             if allowed or self._cparser.method == cparser.HTTP_CONNECT:
-                self._upgraded = True
+                # https://www.rfc-editor.org/info/rfc9110/#section-7.8-15
+                # Defer the protocol switch until the complete request has been
+                # received.
+                self._pending_upgrade = True
         else:
             if upgrade and self._cparser.status_code == 101:
-                self._upgraded = True
+                # llhttp pauses for a 101 on its own; just mark the pending
+                # switch so feed_data returns the upgraded-protocol tail.
+                self._pending_upgrade = True
 
         # do not support old websocket spec
         if SEC_WEBSOCKET_KEY1 in headers:
@@ -597,6 +604,10 @@ cdef class HttpParser:
             cparser.llhttp_resume_after_upgrade(self._cparser)
 
             nb = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
+            if self._pending_upgrade:
+                # A supported upgrade whose request body has now been fully read.
+                self._upgraded = True
+                self._pending_upgrade = False
         elif errno is cparser.HPE_PAUSED:
             # Queue full: cb_on_message_complete() paused llhttp between
             # messages. Buffer the unparsed remainder and resume the parser so
@@ -818,10 +829,7 @@ cdef int cb_on_headers_complete(cparser.llhttp_t* parser) except -1:
         pyparser._last_error = exc
         return -1
     else:
-        if pyparser._upgraded or pyparser._cparser.method == cparser.HTTP_CONNECT:
-            return 2
-        else:
-            return 0
+        return 0
 
 
 cdef int cb_on_body(cparser.llhttp_t* parser,
@@ -852,7 +860,9 @@ cdef int cb_on_message_complete(cparser.llhttp_t* parser) except -1:
         pyparser._last_error = exc
         return -1
     else:
-        if pyparser._max_msg_queue_size and not pyparser._upgraded:
+        if pyparser._max_msg_queue_size and not (
+            pyparser._upgraded or pyparser._pending_upgrade
+        ):
             pyparser._msg_in_flight += 1
             if pyparser._msg_in_flight >= pyparser._max_msg_queue_size:
                 # Queue full: pause llhttp between messages. feed_data() buffers
