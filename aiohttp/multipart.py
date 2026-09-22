@@ -11,6 +11,7 @@ from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncIterator,
     Deque,
     Dict,
     Iterator,
@@ -506,12 +507,37 @@ class BodyPartReader:
         Decoding is done according the specified Content-Encoding
         or Content-Transfer-Encoding headers value.
         """
-        if CONTENT_TRANSFER_ENCODING in self.headers:
-            data = self._decode_content_transfer(data)
-        # https://datatracker.ietf.org/doc/html/rfc7578#section-4.8
-        if not self._is_form_data and CONTENT_ENCODING in self.headers:
+        data = self._apply_content_transfer_decoding(data)
+        if self._needs_content_decoding():
             return self._decode_content(data)
         return data
+
+    async def decode_iter(self, data: bytes) -> AsyncIterator[bytes]:
+        """Async generator that yields decoded data chunks.
+
+        Decodes data according the specified Content-Encoding
+        or Content-Transfer-Encoding headers value.
+
+        This method offloads decompression to an executor for large payloads
+        to avoid blocking the event loop.
+        """
+        data = self._apply_content_transfer_decoding(data)
+        if self._needs_content_decoding():
+            async for d in self._decode_content_async(data):
+                yield d
+        else:
+            yield data
+
+    def _apply_content_transfer_decoding(self, data: bytes) -> bytes:
+        """Apply Content-Transfer-Encoding decoding if header is present."""
+        if CONTENT_TRANSFER_ENCODING in self.headers:
+            return self._decode_content_transfer(data)
+        return data
+
+    def _needs_content_decoding(self) -> bool:
+        """Check if Content-Encoding decoding should be applied."""
+        # https://datatracker.ietf.org/doc/html/rfc7578#section-4.8
+        return not self._is_form_data and CONTENT_ENCODING in self.headers
 
     def _decode_content(self, data: bytes) -> bytes:
         encoding = self.headers.get(CONTENT_ENCODING, "").lower()
@@ -524,6 +550,19 @@ class BodyPartReader:
             ).decompress_sync(data, max_length=self._max_decompress_size)
 
         raise RuntimeError(f"unknown content encoding: {encoding}")
+
+    async def _decode_content_async(self, data: bytes) -> AsyncIterator[bytes]:
+        encoding = self.headers.get(CONTENT_ENCODING, "").lower()
+        if encoding == "identity":
+            yield data
+        elif encoding in {"deflate", "gzip"}:
+            d = ZLibDecompressor(
+                encoding=encoding,
+                suppress_deflate_header=True,
+            )
+            yield await d.decompress(data, max_length=self._max_decompress_size)
+        else:
+            raise RuntimeError(f"unknown content encoding: {encoding}")
 
     def _decode_content_transfer(self, data: bytes) -> bytes:
         encoding = self.headers.get(CONTENT_TRANSFER_ENCODING, "").lower()

@@ -445,6 +445,62 @@ class TestPartReader:
                 result += obj.decode(chunk)
         assert b"Time to Relax!" == result
 
+    async def test_decode_iter_without_encodings(self) -> None:
+        """decode_iter() yields the data untouched when no encoding applies."""
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(BOUNDARY, {}, stream)
+            result = bytearray()
+            async for chunk in obj.decode_iter(b"Time to Relax!"):
+                result.extend(chunk)
+        assert b"Time to Relax!" == result
+
+    async def test_decode_iter_with_content_transfer_encoding_base64(self) -> None:
+        """decode_iter() applies Content-Transfer-Encoding decoding."""
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(
+                BOUNDARY, {CONTENT_TRANSFER_ENCODING: "base64"}, stream
+            )
+            result = bytearray()
+            async for chunk in obj.decode_iter(b"VGltZSB0byBSZWxheCE="):
+                result.extend(chunk)
+        assert b"Time to Relax!" == result
+
+    async def test_decode_iter_with_content_encoding_deflate(self) -> None:
+        """decode_iter() applies Content-Encoding decoding for non form-data."""
+        data = b"\x0b\xc9\xccMU(\xc9W\x08J\xcdI\xacP\x04\x00"
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(
+                BOUNDARY, {CONTENT_ENCODING: "deflate"}, stream
+            )
+            result = bytearray()
+            async for chunk in obj.decode_iter(data):
+                result.extend(chunk)
+        assert b"Time to Relax!" == result
+
+    async def test_decode_iter_form_data_skips_content_encoding(self) -> None:
+        """form-data parts never get Content-Encoding decoding applied."""
+        data = b"\x0b\xc9\xccMU(\xc9W\x08J\xcdI\xacP\x04\x00"
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(
+                BOUNDARY,
+                {CONTENT_ENCODING: "deflate"},
+                stream,
+                subtype="form-data",
+            )
+            result = bytearray()
+            async for chunk in obj.decode_iter(data):
+                result.extend(chunk)
+        assert data == result
+
+    async def test_decode_iter_with_content_encoding_unknown(self) -> None:
+        with Stream(b"") as stream:
+            obj = aiohttp.BodyPartReader(
+                BOUNDARY, {CONTENT_ENCODING: "snappy"}, stream
+            )
+            with pytest.raises(RuntimeError):
+                async for _ in obj.decode_iter(b"Time to Relax!"):
+                    pass
+
     @pytest.mark.parametrize("encoding", ("binary", "8bit", "7bit"))
     async def test_read_with_content_transfer_encoding_binary(
         self, encoding: str

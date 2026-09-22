@@ -1772,6 +1772,48 @@ async def test_app_max_client_size_multipart_cumulative(
     await resp.release()
 
 
+async def test_app_max_client_size_multipart_field_streamed(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """An oversized non-file multipart field is rejected while it is read.
+
+    The body of an ordinary (non-file) field must not be buffered in full
+    before ``client_max_size`` is enforced, otherwise a single field can make
+    the server allocate an unbounded amount of memory.  The 413 has to be
+    raised as soon as the running total crosses the limit, so the reported
+    body size stays within one read chunk of the limit instead of covering
+    the whole field.
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        await request.post()
+        return web.Response(body=b"ok")
+
+    max_size = 1024
+    # Well above the limit, but small enough to be flushed in one go.
+    field_size = 12 * 1024
+    app = web.Application(client_max_size=max_size)
+    app.router.add_post("/", handler)
+    client = await aiohttp_client(app)
+
+    data = FormData(default_to_multipart=True)
+    data.add_field("field", field_size * "x")
+
+    resp = await client.post("/", data=data)
+    assert 413 == resp.status
+    resp_text = await resp.text()
+    assert f"Maximum request body size {max_size} exceeded" in resp_text
+    # Maximum request body size X exceeded, actual body size X
+    body_size = int(resp_text.split()[-1])
+    assert body_size > max_size
+    # The check runs per chunk, so at most one chunk is read past the limit
+    # and the whole field is never accumulated in memory.
+    assert body_size <= max_size + multipart.BodyPartReader.chunk_size
+    assert body_size < field_size
+
+    await resp.release()
+
+
 async def test_app_max_client_size_none(aiohttp_client) -> None:
     async def handler(request):
         await request.post()
