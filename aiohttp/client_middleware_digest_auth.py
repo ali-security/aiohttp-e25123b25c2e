@@ -18,6 +18,7 @@ from typing import (
     FrozenSet,
     List,
     Literal,
+    Optional,
     Tuple,
     TypedDict,
     Union,
@@ -167,6 +168,15 @@ class DigestAuthMiddleware:
     - Includes replay attack protection with client nonce count tracking
     - Supports preemptive authentication per RFC 7616 Section 3.6
 
+    Origin scoping:
+    The credentials are scoped to the origin of the first request the
+    middleware handles. A request to a different origin is passed through
+    untouched, so it never receives a digest response computed from those
+    credentials, unless that origin falls within a protection space the
+    anchor origin advertised through the RFC 7616 ``domain`` directive. Make
+    the first request through the middleware against the intended origin, as
+    the anchor is pinned to it and not reset for the life of the instance.
+
     Standards compliance:
     - RFC 7616: HTTP Digest Access Authentication (primary reference)
     - RFC 2617: HTTP Authentication (deprecated by RFC 7616)
@@ -203,6 +213,8 @@ class DigestAuthMiddleware:
         self._preemptive: bool = preemptive
         # Set of URLs defining the protection space
         self._protection_space: List[str] = []
+        # Origin the credentials are scoped to; set on the first request.
+        self._origin: Optional[URL] = None
 
     async def _encode(
         self, method: str, url: URL, body: Union[Payload, Literal[b""]]
@@ -424,21 +436,23 @@ class DigestAuthMiddleware:
 
         # Update protection space based on domain parameter or default to origin
         origin = response.url.origin()
+        self._protection_space = []
 
         if domain := self._challenge.get("domain"):
             # Parse space-separated list of URIs
-            self._protection_space = []
             for uri in domain.split():
                 # Remove quotes if present
                 uri = uri.strip('"')
+                if not uri:
+                    continue
                 if uri.startswith("/"):
                     # Path-absolute, relative to origin
                     self._protection_space.append(str(origin.join(URL(uri))))
                 else:
                     # Absolute URI
                     self._protection_space.append(str(URL(uri)))
-        else:
-            # No domain specified, protection space is entire origin
+
+        if not self._protection_space:
             self._protection_space = [str(origin)]
 
         # Return True only if we found at least one challenge parameter
@@ -448,6 +462,16 @@ class DigestAuthMiddleware:
         self, request: ClientRequest, handler: ClientHandlerType
     ) -> ClientResponse:
         """Run the digest auth middleware."""
+        # Credentials are scoped to the first request's origin. Other origins
+        # pass through untouched unless a challenge from the anchor origin
+        # advertised them via RFC 7616 domain; mirrors aiohttp stripping
+        # Authorization on cross-origin redirects.
+        origin = request.url.origin()
+        if self._origin is None:
+            self._origin = origin
+        elif origin != self._origin and not self._in_protection_space(request.url):
+            return await handler(request)
+
         response = None
         for retry_count in range(2):
             # Apply authorization header if:
