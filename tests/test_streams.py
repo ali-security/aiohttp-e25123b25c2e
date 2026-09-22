@@ -1725,6 +1725,77 @@ async def test_stream_reader_small_limit_resumes_reading(
     assert protocol._reading_paused is False
 
 
+async def test_readany_does_not_drain_reentrant_refill(
+    protocol: mock.Mock,
+) -> None:
+    """A single readany() must not reassemble data fed re-entrantly.
+
+    Draining below the low water mark resumes reading, which can synchronously
+    refill the buffer (e.g. decompressing another chunk). Joining that refill in
+    one call would reassemble an unbounded body.
+    """
+    loop = asyncio.get_event_loop()
+    stream = streams.StreamReader(protocol, limit=1, loop=loop)
+
+    refills = [b"second", b"third"]
+
+    def pause_reading() -> None:
+        protocol._reading_paused = True
+
+    def resume_reading() -> None:
+        protocol._reading_paused = False
+        if refills:
+            stream.feed_data(refills.pop(0))
+
+    protocol.pause_reading.side_effect = pause_reading
+    protocol.resume_reading.side_effect = resume_reading
+
+    # Every chunk is above the high water mark, so feeding it pauses reading
+    # and popping it resumes reading, which feeds the next one re-entrantly.
+    stream.feed_data(b"first")
+    assert protocol._reading_paused is True
+
+    # Popping "first" refills "second", but this readany() returns only "first".
+    assert await stream.readany() == b"first"
+    assert await stream.readany() == b"second"
+    assert await stream.readany() == b"third"
+    assert not refills
+
+
+async def test_read_nowait_does_not_drain_reentrant_refill(
+    protocol: mock.Mock,
+) -> None:
+    """read_nowait() must not reassemble data fed re-entrantly either.
+
+    It shares ``_read_nowait(-1)`` with readany(), so the same re-entrant
+    refill would otherwise be joined into a single unbounded bytes.
+    """
+    loop = asyncio.get_event_loop()
+    stream = streams.StreamReader(protocol, limit=1, loop=loop)
+
+    refills = [b"second", b"third"]
+
+    def pause_reading() -> None:
+        protocol._reading_paused = True
+
+    def resume_reading() -> None:
+        protocol._reading_paused = False
+        if refills:
+            stream.feed_data(refills.pop(0))
+
+    protocol.pause_reading.side_effect = pause_reading
+    protocol.resume_reading.side_effect = resume_reading
+
+    stream.feed_data(b"first")
+    assert protocol._reading_paused is True
+
+    assert stream.read_nowait() == b"first"
+    assert stream.read_nowait() == b"second"
+    assert stream.read_nowait() == b"third"
+    assert stream.read_nowait() == b""
+    assert not refills
+
+
 async def test_stream_reader_chunk_splits_use_deque(protocol: mock.Mock) -> None:
     """Chunk splits must be a deque so dropping consumed splits is O(1).
 
