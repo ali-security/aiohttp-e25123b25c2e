@@ -1,7 +1,9 @@
 import asyncio
 import io
 import json
+import os
 import pathlib
+import subprocess
 import sys
 import zlib
 from unittest import mock
@@ -223,10 +225,23 @@ class TestPartReader:
         with Stream(data) as stream:
             obj = aiohttp.BodyPartReader(BOUNDARY, {}, stream)
             result = b""
-            with pytest.raises(AssertionError):
+            with pytest.raises(AssertionError, match="Reading after EOF"):
                 for _ in range(4):
                     result += await obj.read_chunk(7)
         assert data == result
+
+    async def test_read_with_content_length_malformed_crlf(self) -> None:
+        # Content-Length is correct but data after content is not \r\n
+        content = b"Hello"
+        h = CIMultiDictProxy(CIMultiDict({"CONTENT-LENGTH": str(len(content))}))
+        # Malformed: "XX" instead of "\r\n" after content
+        with Stream(content + b"XX--:--") as stream:
+            obj = aiohttp.BodyPartReader(BOUNDARY, h, stream)
+            with pytest.raises(
+                AssertionError,
+                match="Reader did not read all the data or it is malformed",
+            ):
+                await obj.read()
 
     async def test_read_boundary_with_incomplete_chunk(self) -> None:
         with Stream(b"") as stream:
@@ -1805,3 +1820,106 @@ async def test_multipart_writer_close_with_exceptions() -> None:
     await writer.close()
     assert part1.close.call_count == 1
     assert part2.close.call_count == 1
+
+
+# Regression test for the multipart DoS: the flow control below used to rely on
+# ``assert`` statements, which ``python -O`` strips.  Without them a truncated or
+# malformed body makes ``BodyPartReader.read()`` (and therefore ``Request.post()``)
+# spin forever on empty chunks.  Run the exploit in a real optimized interpreter so
+# the guards are proven to survive ``-O``.
+OPTIMIZED_MULTIPART_EXPLOIT = r"""
+import asyncio
+import io
+import sys
+from unittest import mock
+
+from multidict import CIMultiDict, CIMultiDictProxy
+
+import aiohttp
+from aiohttp.streams import StreamReader
+from aiohttp.test_utils import make_mocked_request
+
+try:
+    assert False
+except AssertionError:
+    sys.exit("assertions are still enabled, the -O exploit check is meaningless")
+
+
+class Stream:
+    def __init__(self, content):
+        self.content = io.BytesIO(content)
+
+    async def read(self, size=None):
+        return self.content.read(size)
+
+    def at_eof(self):
+        return self.content.tell() == len(self.content.getbuffer())
+
+    async def readline(self):
+        return self.content.readline()
+
+    def unread_data(self, data):
+        self.content = io.BytesIO(data + self.content.read())
+
+
+async def expect_assertion_error(factory, what):
+    try:
+        await factory()
+    except AssertionError:
+        return
+    sys.exit("no AssertionError raised for " + what)
+
+
+async def main():
+    # Truncated body: read() used to loop forever handing back empty chunks.
+    reader = aiohttp.BodyPartReader(b"--:", {}, Stream(b"Hello, World!\r\n--"))
+    await expect_assertion_error(reader.read, "reading after EOF")
+
+    # Content-Length is honoured but the trailing CRLF is malformed.
+    content = b"Hello"
+    headers = CIMultiDictProxy(CIMultiDict({"CONTENT-LENGTH": str(len(content))}))
+    reader = aiohttp.BodyPartReader(b"--:", headers, Stream(content + b"XX--:--"))
+    await expect_assertion_error(reader.read, "malformed CRLF")
+
+    # A field without a name must never reach the parsed POST data.
+    payload = StreamReader(
+        mock.Mock(_reading_paused=False), 2**16, loop=asyncio.get_running_loop()
+    )
+    payload.feed_data(
+        b"-----------------------------326931944431359\r\n"
+        b"Content-Disposition: form-data\r\n"
+        b"\r\n"
+        b"value\r\n"
+        b"-----------------------------326931944431359--\r\n"
+    )
+    payload.feed_eof()
+    req = make_mocked_request(
+        "POST",
+        "/",
+        headers={
+            "CONTENT-TYPE": "multipart/form-data; "
+            "boundary=---------------------------326931944431359"
+        },
+        payload=payload,
+    )
+    await expect_assertion_error(req.post, "multipart field missing name")
+
+
+asyncio.run(main())
+"""
+
+
+# The subprocess call below blocks on purpose; this test drives a separate
+# interpreter rather than the event loop.
+@pytest.mark.skip_blockbuster
+def test_multipart_flow_control_survives_optimized_mode() -> None:
+    env = dict(os.environ)
+    # Make sure the child imports the very aiohttp under test.
+    env["PYTHONPATH"] = str(pathlib.Path(aiohttp.__file__).parent.parent)
+    proc = subprocess.run(
+        [sys.executable, "-O", "-c", OPTIMIZED_MULTIPART_EXPLOIT],
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
