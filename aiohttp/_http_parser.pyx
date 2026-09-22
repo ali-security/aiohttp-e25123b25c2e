@@ -421,7 +421,8 @@ cdef class HttpParser:
         headers = CIMultiDictProxy(CIMultiDict(self._headers))
 
         if self._cparser.type == cparser.HTTP_REQUEST:
-            allowed = upgrade and headers.get("upgrade", "").lower() in ALLOWED_UPGRADES
+            h_upg = headers.get("upgrade", "")
+            allowed = upgrade and h_upg.isascii() and h_upg.lower() in ALLOWED_UPGRADES
             if allowed or self._cparser.method == cparser.HTTP_CONNECT:
                 self._upgraded = True
         else:
@@ -436,9 +437,11 @@ cdef class HttpParser:
         enc = self._content_encoding
         if enc is not None:
             self._content_encoding = None
-            enc = enc.lower()
-            if enc in ('gzip', 'deflate', 'br'):
-                encoding = enc
+            # .lower() can transform non-ascii characters, so check ascii first.
+            if enc.isascii():
+                enc = enc.lower()
+                if enc in ('gzip', 'deflate', 'br'):
+                    encoding = enc
 
         if self._cparser.type == cparser.HTTP_REQUEST:
             method = http_method_str(self._cparser.method)

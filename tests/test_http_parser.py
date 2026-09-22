@@ -469,7 +469,39 @@ def test_request_chunked(parser) -> None:
     assert isinstance(payload, streams.StreamReader)
 
 
-def test_request_te_chunked_with_content_length(parser: Any) -> None:
+# U+212A KELVIN SIGN is not ascii, yet KELVIN_SIGN.lower() == "k", so a
+# case-insensitive comparison written as .lower() treats the header values below
+# as "chunked"/"websocket" while a proxy matching raw bytes does not.
+KELVIN_SIGN = chr(0x212A)
+TE_NON_ASCII = "chun" + KELVIN_SIGN + "ed"
+UPGRADE_NON_ASCII = "websoc" + KELVIN_SIGN + "et"
+
+
+def test_te_header_non_ascii(parser: HttpRequestParser) -> None:
+    text = "GET /test HTTP/1.1\r\nTransfer-Encoding: " + TE_NON_ASCII + "\r\n\r\n"
+    with pytest.raises(http_exceptions.BadHttpMessage):
+        parser.feed_data(text.encode())
+
+
+def test_upgrade_header_non_ascii(parser: HttpRequestParser) -> None:
+    text = "GET /test HTTP/1.1\r\nUpgrade: " + UPGRADE_NON_ASCII + "\r\n\r\n"
+    messages, upgrade, tail = parser.feed_data(text.encode())
+    assert not upgrade
+
+
+def test_conn_upgrade_header_non_ascii(parser: HttpRequestParser) -> None:
+    # Same vector as above, plus the "Connection: upgrade" header that the
+    # pure-Python parser requires before it consults the Upgrade header value.
+    text = (
+        "GET /test HTTP/1.1\r\n"
+        "Connection: upgrade\r\n"
+        "Upgrade: " + UPGRADE_NON_ASCII + "\r\n\r\n"
+    )
+    messages, upgrade, tail = parser.feed_data(text.encode())
+    assert not upgrade
+
+
+def test_request_te_chunked_with_content_length(parser: HttpRequestParser) -> None:
     text = (
         b"GET /test HTTP/1.1\r\n"
         b"content-length: 1234\r\n"
@@ -557,6 +589,17 @@ def test_compression_brotli(parser) -> None:
     messages, upgrade, tail = parser.feed_data(text)
     msg = messages[0][0]
     assert msg.compression == "br"
+
+
+def test_compression_non_ascii(parser: HttpRequestParser) -> None:
+    # U+FB02 LATIN SMALL LIGATURE FL case-folds to "fl", so "de<FL>ate" is a
+    # non-ascii look-alike of "deflate".
+    enc = ("de" + chr(0xFB02) + "ate").encode()
+    text = b"GET /test HTTP/1.1\r\ncontent-encoding: " + enc + b"\r\n\r\n"
+    messages, upgrade, tail = parser.feed_data(text)
+    msg = messages[0][0]
+    # Non-ascii input should not evaluate to a valid encoding scheme.
+    assert msg.compression is None
 
 
 def test_compression_unknown(parser) -> None:

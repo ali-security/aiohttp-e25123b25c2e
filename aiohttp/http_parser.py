@@ -237,7 +237,9 @@ class HeadersParser:
 
 def _is_supported_upgrade(headers: CIMultiDictProxy[str]) -> bool:
     """Check if the upgrade header is supported."""
-    return headers.get(hdrs.UPGRADE, "").lower() in {"tcp", "websocket"}
+    u = headers.get(hdrs.UPGRADE, "")
+    # .lower() can transform non-ascii characters.
+    return u.isascii() and u.lower() in {"tcp", "websocket"}
 
 
 class HttpParser(abc.ABC, Generic[_MsgT]):
@@ -549,7 +551,8 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
 
         # encoding
         enc = headers.get(hdrs.CONTENT_ENCODING)
-        if enc:
+        # .lower() can transform non-ascii characters, so must check ascii first.
+        if enc and enc.isascii():
             enc = enc.lower()
             if enc in ("gzip", "deflate", "br"):
                 encoding = enc
@@ -669,7 +672,9 @@ class HttpRequestParser(HttpParser[RawRequestMessage]):
         )
 
     def _is_chunked_te(self, te: str) -> bool:
-        if te.rsplit(",", maxsplit=1)[-1].strip(" \t").lower() == "chunked":
+        te = te.rsplit(",", maxsplit=1)[-1].strip(" \t")
+        # .lower() transforms some non-ascii chars, so must check first.
+        if te.isascii() and te.lower() == "chunked":
             return True
         # https://www.rfc-editor.org/rfc/rfc9112#section-6.3-2.4.3
         raise BadHttpMessage("Request has invalid `Transfer-Encoding`")
