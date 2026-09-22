@@ -721,8 +721,8 @@ class BaseRequest(MutableMapping[str, Any], HeadersMixin):
             multipart = await self.multipart()
             max_size = self._client_max_size
 
+            size = 0
             while (field := await multipart.next()) is not None:
-                size = 0
                 field_ct = field.headers.get(hdrs.CONTENT_TYPE)
 
                 if isinstance(field, BodyPartReader):

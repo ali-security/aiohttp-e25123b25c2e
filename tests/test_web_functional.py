@@ -1705,8 +1705,8 @@ async def test_app_max_client_size(aiohttp_client) -> None:
     await resp.release()
 
 
-async def test_app_max_client_size_adjusted(aiohttp_client) -> None:
-    async def handler(request):
+async def test_app_max_client_size_adjusted(aiohttp_client: AiohttpClient) -> None:
+    async def handler(request: web.Request) -> web.Response:
         await request.post()
         return web.Response(body=b"ok")
 
@@ -1733,6 +1733,41 @@ async def test_app_max_client_size_adjusted(aiohttp_client) -> None:
     # Maximum request body size X exceeded, actual body size X
     body_size = int(resp_text.split()[-1])
     assert body_size >= custom_max_size
+
+    await resp.release()
+
+
+async def test_app_max_client_size_multipart_cumulative(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """client_max_size must be applied to the whole multipart body.
+
+    Every individual part stays below the limit while their combined size
+    exceeds it, so the request has to be rejected with 413 instead of being
+    accepted one small part at a time.
+    """
+
+    async def handler(request: web.Request) -> web.Response:
+        await request.post()
+        return web.Response(body=b"ok")
+
+    max_size = 1024
+    part_size = max_size // 2
+    app = web.Application(client_max_size=max_size)
+    app.router.add_post("/", handler)
+    client = await aiohttp_client(app)
+
+    data = FormData(default_to_multipart=True)
+    for i in range(4):
+        data.add_field(f"field{i}", part_size * "x")
+
+    resp = await client.post("/", data=data)
+    assert 413 == resp.status
+    resp_text = await resp.text()
+    assert f"Maximum request body size {max_size} exceeded" in resp_text
+    # Maximum request body size X exceeded, actual body size X
+    body_size = int(resp_text.split()[-1])
+    assert body_size > max_size
 
     await resp.release()
 
