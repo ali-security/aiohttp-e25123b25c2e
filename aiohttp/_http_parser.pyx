@@ -585,6 +585,9 @@ cdef class HttpParser:
         cdef:
             size_t data_len
             size_t nb
+            char* base
+            const char* error_pos
+            Py_ssize_t error_off
             cdef cparser.llhttp_errno_t errno
 
         if self._queued_tail:
@@ -594,6 +597,9 @@ cdef class HttpParser:
 
         PyObject_GetBuffer(data, &self.py_buf, PyBUF_SIMPLE)
         data_len = <size_t>self.py_buf.len
+        # Cache the buffer base: it is needed to turn an llhttp error position into
+        # an offset after PyBuffer_Release() below, and is only ever subtracted.
+        base = <char*>self.py_buf.buf
 
         errno = cparser.llhttp_execute(
             self._cparser,
@@ -603,7 +609,7 @@ cdef class HttpParser:
         if errno is cparser.HPE_PAUSED_UPGRADE:
             cparser.llhttp_resume_after_upgrade(self._cparser)
 
-            nb = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
+            nb = cparser.llhttp_get_error_pos(self._cparser) - base
             if self._pending_upgrade:
                 # A supported upgrade whose request body has now been fully read.
                 self._upgraded = True
@@ -612,7 +618,7 @@ cdef class HttpParser:
             # Queue full: cb_on_message_complete() paused llhttp between
             # messages. Buffer the unparsed remainder and resume the parser so
             # feed_data(b"") re-feeds it once the queue drains.
-            nb = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
+            nb = cparser.llhttp_get_error_pos(self._cparser) - base
             self._queued_tail = bytes(data[nb:])
             cparser.llhttp_resume(self._cparser)
 
@@ -625,11 +631,12 @@ cdef class HttpParser:
                     ex = self._last_error
                     self._last_error = None
                 else:
-                    after = cparser.llhttp_get_error_pos(self._cparser)
-                    before = data[:after - <char*>self.py_buf.buf]
-                    after_b = after.split(b"\r\n", 1)[0]
+                    error_pos = cparser.llhttp_get_error_pos(self._cparser)
+                    error_off = error_pos - base
+                    before = data[:error_off]
+                    after = data[error_off:].split(b"\r\n", 1)[0]
                     before = before.rsplit(b"\r\n", 1)[-1]
-                    data = before + after_b
+                    data = before + after
                     pointer = " " * (len(repr(before))-1) + "^"
                     ex = parser_error_from_errno(self._cparser, data, pointer)
                 self._payload = None
