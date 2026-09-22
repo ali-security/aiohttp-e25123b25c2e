@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import heapq
 import itertools
+import json
 import os  # noqa
 import pathlib
 import pickle
@@ -16,6 +17,7 @@ from http.cookies import BaseCookie, Morsel, SimpleCookie
 from typing import (
     DefaultDict,
     Dict,
+    FrozenSet,
     Iterable,
     Iterator,
     List,
@@ -46,6 +48,46 @@ _FORMAT_DOMAIN_REVERSED = "{1}.{0}".format
 # heap too often when there are only a few scheduled expirations.
 _MIN_SCHEDULED_COOKIE_EXPIRATION = 100
 _SIMPLE_COOKIE = SimpleCookie()
+
+
+class _RestrictedCookieUnpickler(pickle._Unpickler):
+    """A restricted unpickler that only allows cookie-related types.
+
+    This prevents arbitrary code execution when loading pickled cookie data
+    from untrusted sources. Only types that are expected in a serialized
+    CookieJar are permitted.
+
+    Subclasses :class:`pickle._Unpickler` (the pure-Python implementation)
+    rather than :class:`pickle.Unpickler` because the accelerated unpickler
+    on some implementations (notably PyPy) does not dispatch through
+    :meth:`find_class` overrides.
+
+    See: https://docs.python.org/3/library/pickle.html#restricting-globals
+    """
+
+    _ALLOWED_CLASSES: FrozenSet[Tuple[str, str]] = frozenset(
+        {
+            # Core cookie types
+            ("http.cookies", "SimpleCookie"),
+            ("http.cookies", "Morsel"),
+            # Container types used by CookieJar._cookies
+            ("collections", "defaultdict"),
+            # builtins that pickle uses for reconstruction
+            ("builtins", "tuple"),
+            ("builtins", "set"),
+            ("builtins", "frozenset"),
+            ("builtins", "dict"),
+        }
+    )
+
+    def find_class(self, module: str, name: str) -> type:
+        if (module, name) not in self._ALLOWED_CLASSES:
+            raise pickle.UnpicklingError(
+                f"Forbidden class: {module}.{name}. "
+                "CookieJar.load() only allows cookie-related types for security. "
+                "See https://docs.python.org/3/library/pickle.html#restricting-globals"
+            )
+        return super().find_class(module, name)  # type: ignore[no-any-return]
 
 
 class CookieJar(AbstractCookieJar):
@@ -128,9 +170,57 @@ class CookieJar(AbstractCookieJar):
             pickle.dump(self._cookies, f, pickle.HIGHEST_PROTOCOL)
 
     def load(self, file_path: PathLike) -> None:
+        """Load cookies from a file.
+
+        Reads either format so a sealed jar interoperates with other
+        patched aiohttp versions:
+
+        * JSON — the format written by upstream aiohttp >= 3.14; parsed
+          directly, it cannot execute code.
+        * pickle — the format this version writes and the format written
+          by unpatched aiohttp. Deserialized through a restricted
+          unpickler that only permits cookie-related types, so a malicious
+          pickle payload cannot execute arbitrary code (CVE-2026-34993).
+
+        ``save()`` keeps writing pickle, so files stay readable by
+        unpatched aiohttp; adding the JSON read path only widens what this
+        version can *consume*, it does not change what it produces.
+        """
         file_path = pathlib.Path(file_path)
-        with file_path.open(mode="rb") as f:
-            self._cookies = pickle.load(f)
+        try:
+            with file_path.open(mode="r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            # Not JSON -> pickle format (this version or unpatched aiohttp).
+            with file_path.open(mode="rb") as f:
+                self._cookies = _RestrictedCookieUnpickler(f).load()
+        else:
+            self._cookies = self._load_json_data(data)
+
+    def _load_json_data(
+        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]]
+    ) -> DefaultDict[Tuple[str, str], SimpleCookie]:
+        """Rebuild the cookie mapping from parsed JSON data."""
+        cookies: DefaultDict[Tuple[str, str], SimpleCookie] = defaultdict(SimpleCookie)
+        for compound_key, cookie_data in data.items():
+            domain, path = compound_key.split("|", 1)
+            key = (domain, path)
+            for name, morsel_data in cookie_data.items():
+                morsel: Morsel[str] = Morsel()
+                # __setstate__ bypasses validation and sets already-validated
+                # state, the same pattern used in _build_morsel.
+                morsel.__setstate__(  # type: ignore[attr-defined]
+                    {
+                        "key": morsel_data["key"],
+                        "value": morsel_data["value"],
+                        "coded_value": morsel_data["coded_value"],
+                    }
+                )
+                for attr, attr_val in morsel_data.items():
+                    if attr not in ("key", "value", "coded_value"):
+                        morsel[attr] = attr_val  # type: ignore[assignment]
+                cookies[key][name] = morsel
+        return cookies
 
     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
         if predicate is None:

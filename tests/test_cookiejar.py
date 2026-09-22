@@ -2,12 +2,14 @@ import asyncio
 import datetime
 import heapq
 import itertools
+import json
 import logging
 import pathlib
 import pickle
 import unittest
 from http.cookies import BaseCookie, Morsel, SimpleCookie
 from operator import not_
+from pathlib import Path
 from typing import List, Set
 from unittest import mock
 
@@ -1603,3 +1605,146 @@ async def test_shared_cookie_with_multiple_domains() -> None:
     # Verify cache is reused efficiently
     assert ("", "") in jar._morsel_cache
     assert "universal" in jar._morsel_cache[("", "")]
+
+
+# === Security tests for the restricted cookie unpickler (CVE-2026-34993) ===
+
+
+def test_load_rejects_malicious_pickle(tmp_path: Path) -> None:
+    """CookieJar.load() must block arbitrary code execution via pickle.
+
+    A crafted pickle payload using os.system (a non-cookie class) must be
+    rejected by the restricted unpickler.
+    """
+    import os
+
+    file_path = tmp_path / "malicious.pkl"
+
+    class RCEPayload:
+        def __reduce__(self) -> "tuple[object, ...]":
+            return (os.system, ("echo PWNED",))
+
+    with open(file_path, "wb") as f:
+        pickle.dump(RCEPayload(), f, pickle.HIGHEST_PROTOCOL)
+
+    jar = CookieJar()
+    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
+        jar.load(file_path)
+
+
+def test_load_rejects_eval_payload(tmp_path: Path) -> None:
+    """CookieJar.load() must block eval-based pickle payloads."""
+    file_path = tmp_path / "eval_payload.pkl"
+
+    class EvalPayload:
+        def __reduce__(self) -> "tuple[object, ...]":
+            return (eval, ("__import__('os').system('echo PWNED')",))
+
+    with open(file_path, "wb") as f:
+        pickle.dump(EvalPayload(), f, pickle.HIGHEST_PROTOCOL)
+
+    jar = CookieJar()
+    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
+        jar.load(file_path)
+
+
+def test_load_rejects_subprocess_payload(tmp_path: Path) -> None:
+    """CookieJar.load() must block subprocess-based pickle payloads."""
+    import subprocess
+
+    file_path = tmp_path / "subprocess_payload.pkl"
+
+    class SubprocessPayload:
+        def __reduce__(self) -> "tuple[object, ...]":
+            return (subprocess.call, (["echo", "PWNED"],))
+
+    with open(file_path, "wb") as f:
+        pickle.dump(SubprocessPayload(), f, pickle.HIGHEST_PROTOCOL)
+
+    jar = CookieJar()
+    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
+        jar.load(file_path)
+
+
+def test_load_does_not_execute_payload_side_effect(tmp_path: Path) -> None:
+    """The payload's side effect must never run while loading.
+
+    The payload is a raw pickle stream (``GLOBAL os mkdir`` then ``REDUCE``):
+    plain ``pickle.load()`` would call ``os.mkdir()`` and create ``marker``.
+    The load must be refused before the callable is ever invoked.
+    """
+    file_path = tmp_path / "side_effect.pkl"
+    marker = tmp_path / "pwned"
+
+    payload = b"cos\nmkdir\n(S" + repr(str(marker)).encode("ascii") + b"\ntR."
+    file_path.write_bytes(payload)
+
+    jar = CookieJar()
+    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
+        jar.load(file_path)
+
+    assert not marker.exists()
+
+
+def test_load_rejects_protocol_0_global_payload(tmp_path: Path) -> None:
+    """The legacy protocol-0 GLOBAL opcode must be restricted as well."""
+    import os
+
+    file_path = tmp_path / "legacy_protocol.pkl"
+
+    class LegacyRCEPayload:
+        def __reduce__(self) -> "tuple[object, ...]":
+            return (os.system, ("echo PWNED",))
+
+    with open(file_path, "wb") as f:
+        pickle.dump(LegacyRCEPayload(), f, 0)
+
+    jar = CookieJar()
+    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
+        jar.load(file_path)
+
+
+# === JSON read compatibility with patched aiohttp >= 3.14 (CVE-2026-34993) ===
+#
+# save() keeps writing pickle (unpatched aiohttp still reads it), but load()
+# also accepts the JSON format written by upstream aiohttp >= 3.14, so a sealed
+# jar can consume a cookie file produced by a patched peer. Parsing JSON cannot
+# execute code, so this read path is not a deserialization vector.
+
+
+def test_load_reads_upstream_json_format(tmp_path: Path, loop) -> None:
+    """load() accepts the JSON layout written by upstream aiohttp >= 3.14."""
+    file_path = tmp_path / "upstream.json"
+    file_path.write_text(
+        json.dumps(
+            {
+                "example.com|/": {
+                    "sid": {
+                        "key": "sid",
+                        "value": "abc",
+                        "coded_value": "abc",
+                        "domain": "example.com",
+                        "path": "/",
+                    }
+                }
+            }
+        )
+    )
+
+    jar = CookieJar(loop=loop)
+    jar.load(file_path)
+    assert "sid" in jar.filter_cookies(URL("https://example.com/"))
+
+
+def test_load_json_format_cannot_execute_code(tmp_path: Path, loop) -> None:
+    """A JSON file is parsed as data; embedded class names do not resolve."""
+    file_path = tmp_path / "json_payload.json"
+    # Even if an attacker names os.system inside JSON, it stays an inert string.
+    file_path.write_text(
+        json.dumps({"example.com|/": {"x": {"key": "os", "value": "system",
+                                            "coded_value": "system"}}})
+    )
+
+    jar = CookieJar(loop=loop)
+    jar.load(file_path)  # must not raise and must not execute anything
+    assert "x" in jar.filter_cookies(URL("https://example.com/"))
