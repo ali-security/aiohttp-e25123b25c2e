@@ -1040,16 +1040,43 @@ def test_parse_set_cookie_headers_date_formats_with_attributes() -> None:
     assert result[1][1]["samesite"] == "Strict"
 
 
+def _stdlib_rejects_control_chars() -> bool:
+    """Report whether the running stdlib refuses control chars in a Morsel."""
+    try:
+        Morsel().set("name", "\nnewline\n", r'"\012newline\012"')
+    except CookieError:
+        return True
+    return False
+
+
+# CPython grew a "Control characters are not allowed in cookies" guard in
+# http.cookies.Morsel.set after 3.12.14 was released, so on a newer interpreter
+# patch level the octal escapes that decode to control characters can no longer
+# round-trip through a Morsel at all. The remaining octal case still exercises
+# aiohttp/_cookie_helpers.py's unquoting on every interpreter.
+_needs_permissive_stdlib_cookies = pytest.mark.skipif(
+    _stdlib_rejects_control_chars(),
+    reason="stdlib http.cookies rejects control characters in Morsel values",
+)
+
+
 @pytest.mark.parametrize(
     ("header", "expected_name", "expected_value", "expected_coded"),
     [
         # Test cookie values with octal escape sequences
-        (r'name="\012newline\012"', "name", "\nnewline\n", r'"\012newline\012"'),
-        (
+        pytest.param(
+            r'name="\012newline\012"',
+            "name",
+            "\nnewline\n",
+            r'"\012newline\012"',
+            marks=_needs_permissive_stdlib_cookies,
+        ),
+        pytest.param(
             r'tab="\011separated\011values"',
             "tab",
             "\tseparated\tvalues",
             r'"\011separated\011values"',
+            marks=_needs_permissive_stdlib_cookies,
         ),
         (
             r'mixed="hello\040world\041"',
@@ -1057,11 +1084,12 @@ def test_parse_set_cookie_headers_date_formats_with_attributes() -> None:
             "hello world!",
             r'"hello\040world\041"',
         ),
-        (
+        pytest.param(
             r'complex="\042quoted\042 text with \012 newline"',
             "complex",
             '"quoted" text with \n newline',
             r'"\042quoted\042 text with \012 newline"',
+            marks=_needs_permissive_stdlib_cookies,
         ),
     ],
 )

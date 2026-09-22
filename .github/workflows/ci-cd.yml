@@ -1,28 +1,25 @@
 name: CI
 
 on:
-  merge_group:
-  push:
-    branches:
-      - 'master'
-      - '[0-9].[0-9]+'  # matches to backport branches, e.g. 3.6
-    tags: [ 'v*' ]
-  pull_request:
-    branches:
-      - 'master'
-      - '[0-9].[0-9]+'
-  schedule:
-    - cron:  '0 6 * * *'  # Daily 6AM UTC build
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Extra arguments appended to the pytest invocation'
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   COLOR: yes
   FORCE_COLOR: 1  # Request colored output from CLI tools supporting it
   MYPY_FORCE_COLOR: 1
   PY_COLORS: 1
+  # Resolve PyPI as it looked on the 3.12.14 release date so the build backend
+  # (and every unpinned tool) matches the published wheels' `Generator:` line.
+  PIP_INDEX_URL: https://:2025-07-10@time-machines-pypi.sealsecurity.io/
 
 jobs:
 
@@ -144,8 +141,11 @@ jobs:
           #   pyver: "3.14"
           #   experimental: true
           #   no-extensions: 'Y'
-      fail-fast: true
+      # Let every matrix leg report its own result instead of cancelling the
+      # siblings on the first red one, so one dispatch surfaces every failure.
+      fail-fast: false
     runs-on: ${{ matrix.os }}-latest
+    timeout-minutes: 45
     continue-on-error: ${{ matrix.experimental }}
     steps:
     - name: Checkout
@@ -197,7 +197,7 @@ jobs:
         PIP_USER: 1
       run: >-
         PATH="${HOME}/Library/Python/3.11/bin:${HOME}/.local/bin:${PATH}"
-        pytest --junitxml=junit.xml
+        pytest --junitxml=junit.xml ${{ inputs.test-filter }}
       shell: bash
     - name: Re-run the failing tests with maximum verbosity
       if: failure()
@@ -221,28 +221,13 @@ jobs:
         PIP_USER: 1
       run: |
         python -m coverage xml
-    - name: Upload coverage
-      uses: codecov/codecov-action@v5
-      with:
-        file: ./coverage.xml
-        flags: >-
-          CI-GHA,OS-${{
-            runner.os
-          }},VM-${{
-            matrix.os
-          }},Py-${{
-            steps.python-install.outputs.python-version
-          }}
-        token: ${{ secrets.CODECOV_TOKEN }}
-    - name: Upload test results to Codecov
-      if: ${{ !cancelled() }}
-      uses: codecov/test-results-action@v1
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
+    # Codecov upload steps removed: the fork has no CODECOV_TOKEN secret.
 
   benchmark:
     name: Benchmark
     needs: gen_llhttp
+    # Disabled on the fork: CodSpeedHQ/action requires the CODSPEED_TOKEN secret.
+    if: false
 
     runs-on: ubuntu-latest
     timeout-minutes: 9
@@ -289,6 +274,7 @@ jobs:
     - test
 
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
     - name: Decide whether the needed jobs succeeded or failed
@@ -299,9 +285,10 @@ jobs:
   pre-deploy:
     name: Pre-Deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: check
-    # Run only on pushing a tag
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    # Tag gate dropped: the fork build is dispatched manually, not by pushing a tag,
+    # and the release artifacts must be produced on every dispatch.
     steps:
       - name: Dummy
         run: |
@@ -310,6 +297,7 @@ jobs:
   build-tarball:
     name: Tarball
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: pre-deploy
     steps:
     - name: Checkout
@@ -345,10 +333,14 @@ jobs:
   build-wheels:
     name: Build wheels on ${{ matrix.os }} ${{ matrix.qemu }} ${{ matrix.musl }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     needs: pre-deploy
     strategy:
       matrix:
-        os: ["ubuntu-latest", "windows-latest", "macos-latest", "ubuntu-24.04-arm"]
+        # windows-2022 is what `windows-latest` resolved to when 3.12.14 was
+        # released; the MSVC toolset on windows-2025 adds an extra
+        # api-ms-win-crt-string-l1-1-0.dll import to the win_amd64 .pyd files.
+        os: ["ubuntu-latest", "windows-2022", "macos-latest", "ubuntu-24.04-arm"]
         qemu: ['']
         musl: [""]
         include:
@@ -422,6 +414,11 @@ jobs:
       env:
         CIBW_SKIP: pp* ${{ matrix.musl == 'musllinux' && '*manylinux*' || '*musllinux*' }}
         CIBW_ARCHS_MACOS: x86_64 arm64 universal2
+        # cibuildwheel builds each wheel in an isolated env that pip-installs the
+        # build backend fresh, so the time-machine index has to be injected INSIDE
+        # the build container too — otherwise setuptools resolves to today's
+        # release and the WHEEL `Generator:` watermark drifts off setuptools 80.9.0.
+        CIBW_ENVIRONMENT: PIP_INDEX_URL=https://:2025-07-10@time-machines-pypi.sealsecurity.io/
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
@@ -437,6 +434,10 @@ jobs:
     name: Deploy
     needs: [build-tarball, build-wheels]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Disabled on the fork: makes a GitHub release, publishes to PyPI via trusted
+    # publishing and signs with Sigstore — all need credentials we do not have.
+    if: false
 
     permissions:
       contents: write  # IMPORTANT: mandatory for making GitHub Releases
