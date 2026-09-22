@@ -132,7 +132,7 @@ class WebSocketDataQueue:
 
 class WebSocketReader:
     def __init__(
-        self, queue: WebSocketDataQueue, max_msg_size: int, compress: bool = True
+        self, queue: WebSocketDataQueue, max_msg_size: int, compress: bool = False
     ) -> None:
         self.queue = queue
         self._max_msg_size = max_msg_size

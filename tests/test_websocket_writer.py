@@ -147,7 +147,7 @@ async def test_concurrent_messages(
         writer = WebSocketWriter(protocol, transport, compress=15)
         loop = asyncio.get_running_loop()
         queue = WebSocketDataQueue(mock.Mock(_reading_paused=False), 2**16, loop=loop)
-        reader = WebSocketReader(queue, 50000)
+        reader = WebSocketReader(queue, 50000, compress=True)
         writers = []
         payloads = []
         for count in range(1, 64 + 1):
